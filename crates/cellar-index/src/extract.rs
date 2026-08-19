@@ -226,6 +226,13 @@ impl<'a> FactoryScan<'a> {
         Self {
             exports_binding: named("exports")
                 .or_else(|| by_exports.and_then(|i| params[i]))
+                // `exports` always immediately follows `module`, so knowing one
+                // gives the other. This matters because arity cannot separate
+                // the six-parameter convention plus an injected dependency from
+                // the seven-parameter convention — `GeminiEmojiCategories` is
+                // seven parameters of the former, and reading it by arity looks
+                // for exports on the injected `fbt` and finds none.
+                .or_else(|| by_module.and_then(|i| params.get(i + 1).copied().flatten()))
                 .or_else(|| param_name(factory, e)),
             module_binding: named("module")
                 .or_else(|| by_module.and_then(|i| params[i]))
@@ -381,6 +388,22 @@ mod tests {
                }), 98);"#,
         );
         assert_eq!(f.exports, ["Component"]);
+    }
+
+    /// Seven parameters, but the *six*-parameter convention plus one injected
+    /// dependency — which arity alone cannot distinguish from the seven-parameter
+    /// convention. `module.exports` settles it, and `exports` follows `module`.
+    /// Taken from `GeminiEmojiCategories`.
+    #[test]
+    fn six_parameters_plus_an_injected_dependency_is_not_the_long_convention() {
+        let f = facts(
+            r#"__d("M", ["fbt"], (function(t, n, r, o, a, i, l) {
+                 a.exports = { name: l._("") };
+                 i.helper = 1;
+               }), 98);"#,
+        );
+        // `a` is module, so `i` is exports — not `l`, which is the injected fbt.
+        assert_eq!(f.exports, ["default", "helper"]);
     }
 
     /// The other convention: six parameters, `exports` fifth. Both shapes appear
