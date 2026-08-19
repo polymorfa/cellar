@@ -23,6 +23,7 @@ use similar::{ChangeTag, TextDiff};
 
 use crate::filter::FilterSet;
 use crate::model::{BundleId, ModuleEntry, ModuleIndex, SCHEMA_VERSION};
+use crate::shape;
 
 /// Supplies module source text on demand. Implemented by
 /// [`BundleHandle`](crate::store::BundleHandle); a test can supply its own.
@@ -53,6 +54,14 @@ pub struct DiffOptions {
     /// Report modules whose only changed lines are noise. When false they are
     /// counted in the summary but left out of `changes`.
     pub include_noise_only: bool,
+    /// Classify each changed module by comparing the two programs with their
+    /// local names erased, and name the functions that really changed.
+    ///
+    /// Off by default because it parses both sides of every changed module,
+    /// which the sha256 comparison does not. It costs roughly a second per
+    /// thousand modules and is the difference between "7,400 modules differ"
+    /// and a list you can read.
+    pub semantic: bool,
 }
 
 impl Default for DiffOptions {
@@ -63,6 +72,7 @@ impl Default for DiffOptions {
             max_diff_bytes: 1 << 20,
             max_hunk_bytes: 64 * 1024,
             include_noise_only: false,
+            semantic: false,
         }
     }
 }
@@ -103,6 +113,34 @@ pub struct ModuleChange {
     /// Every changed line matched the filter's `noiseCode` rules.
     #[serde(default, skip_serializing_if = "is_false")]
     pub noise_only: bool,
+    /// What the program did, as opposed to what the text did.
+    ///
+    /// `noiseOnly` above is a line-level guess: it can recognise a changed line
+    /// that *looks* like transpiler output, and nothing more. It cannot see a
+    /// rename cascade, which is the dominant form of noise in a minified bundle
+    /// — inserting one binding renames every local after it, and each of those
+    /// lines looks like real code because it is real code that means exactly
+    /// what it meant before. This field is decided by comparing the two modules
+    /// with their local names erased, so `renamedOnly` is a proof rather than a
+    /// pattern match. Absent when the semantic pass was not requested or the
+    /// module did not parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<shape::Verdict>,
+    /// The functions that actually changed, by the name they are exported
+    /// under. A module reported as changed with this list empty changed only
+    /// outside its functions — a dependency, a top-level constant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions_changed: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions_added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions_removed: Vec<String>,
+    /// Functions whose program is unchanged however they were renamed or moved,
+    /// and the total. `40/46 kept` is the sentence a reviewer needs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions_kept: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub functions_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lines_added: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +230,12 @@ pub fn diff_bundles(
                     deps_added: retain_signal(&n.deps, &[], filter),
                     deps_removed: vec![],
                     deps_noise_only: false,
+                    verdict: None,
+                    functions_changed: Vec::new(),
+                    functions_added: Vec::new(),
+                    functions_removed: Vec::new(),
+                    functions_kept: None,
+                    functions_total: None,
                     exports_added: n.exports.clone(),
                     exports_removed: vec![],
                     similarity: None,
@@ -214,6 +258,12 @@ pub fn diff_bundles(
                     deps_added: vec![],
                     deps_removed: retain_signal(&o.deps, &[], filter),
                     deps_noise_only: false,
+                    verdict: None,
+                    functions_changed: Vec::new(),
+                    functions_added: Vec::new(),
+                    functions_removed: Vec::new(),
+                    functions_kept: None,
+                    functions_total: None,
                     exports_added: vec![],
                     exports_removed: o.exports.clone(),
                     similarity: None,
@@ -246,8 +296,19 @@ pub fn diff_bundles(
                     let old_text = old_src.load(o)?;
                     let new_text = new_src.load(n)?;
                     apply_text_diff(&mut change, &old_text, &new_text, filter, opts);
+                    if opts.semantic {
+                        apply_semantic_diff(&mut change, &old_text, &new_text);
+                    }
                 }
 
+                // A proof outranks a guess. The line rules can only recognise
+                // changed lines that *look* like transpiler output; the shape
+                // comparison knows the two programs are the same one, whatever
+                // the lines say. Where they disagree, take the proof — that is
+                // the whole reason for computing it.
+                if change.verdict == Some(shape::Verdict::RenamedOnly) {
+                    change.noise_only = true;
+                }
                 if change.noise_only {
                     summary.noise_only += 1;
                     if !opts.include_noise_only {
@@ -322,11 +383,40 @@ fn modified_change(
         exports_removed: diff_lists(&o.exports, &n.exports),
         similarity: None,
         noise_only: false,
+        verdict: None,
+        functions_changed: Vec::new(),
+        functions_added: Vec::new(),
+        functions_removed: Vec::new(),
+        functions_kept: None,
+        functions_total: None,
         lines_added: None,
         lines_removed: None,
         hunks: None,
         hunks_omitted: None,
     }
+}
+
+/// Decide what the *program* did, and name the functions it did it in.
+///
+/// The text diff above answers "which lines are different", which in a minified
+/// bundle is mostly a question about the minifier. This answers "is this a
+/// different program", and when it is, "which functions" — the two things a
+/// reviewer actually wants and neither of which a line diff can supply.
+fn apply_semantic_diff(change: &mut ModuleChange, old_text: &str, new_text: &str) {
+    let verdict = shape::compare(old_text, new_text);
+    change.verdict = Some(verdict);
+    // Nothing to localise: either the program is the same, or one side did not
+    // parse and any function list would be invented rather than measured.
+    if !matches!(verdict, shape::Verdict::Changed) {
+        return;
+    }
+
+    let d = shape::diff_functions(old_text, new_text);
+    change.functions_changed = d.changed.iter().map(|c| c.label.clone()).collect();
+    change.functions_added = d.added.iter().map(|f| f.label.clone()).collect();
+    change.functions_removed = d.removed.iter().map(|f| f.label.clone()).collect();
+    change.functions_kept = Some(d.kept as u32);
+    change.functions_total = Some(d.total as u32);
 }
 
 fn apply_text_diff(
@@ -519,6 +609,67 @@ mod tests {
         assert_eq!(d.changes.len(), 1);
         assert!(!d.changes[0].noise_only);
         assert!(d.changes[0].hunks.as_ref().unwrap().contains("sendStanza"));
+    }
+
+    /// The case the line rules cannot reach. Every changed line here is real
+    /// code that reads as real code; only erasing the names shows the two
+    /// programs are the same one.
+    #[test]
+    fn a_rename_cascade_is_noise_the_line_rules_cannot_see() {
+        let old = idx(1, vec![entry("M", "aaa", &[], 90)]);
+        let new = idx(2, vec![entry("M", "bbb", &[], 90)]);
+        let ol = loader(&[("M", "var h = 1, y = 2;\nfunction f() { return h + y }\n")]);
+        let nl = loader(&[("M", "var y = 1, C = 2;\nfunction g() { return y + C }\n")]);
+
+        // Without the semantic pass this is three changed lines of ordinary
+        // code, and the line rules are right to call it a change on what they
+        // can see.
+        let d = diff_bundles(&old, &ol, &new, &nl, &keep_all(), &DiffOptions::default()).unwrap();
+        assert_eq!(d.changes.len(), 1);
+        assert!(!d.changes[0].noise_only);
+
+        let opts = DiffOptions {
+            semantic: true,
+            include_noise_only: true,
+            ..Default::default()
+        };
+        let d = diff_bundles(&old, &ol, &new, &nl, &keep_all(), &opts).unwrap();
+        assert_eq!(d.changes[0].verdict, Some(shape::Verdict::RenamedOnly));
+        assert!(d.changes[0].noise_only, "a proof outranks the line rules");
+        assert_eq!(d.summary.noise_only, 1);
+    }
+
+    /// And it must not swallow a real edit hiding inside that same cascade.
+    #[test]
+    fn a_real_change_inside_a_cascade_is_named() {
+        let old = idx(1, vec![entry("M", "aaa", &[], 90)]);
+        let new = idx(2, vec![entry("M", "bbb", &[], 90)]);
+        // A real module shape: the factory's last parameter is the exports
+        // object, and that is what makes `check` a name rather than a letter.
+        let ol = loader(&[(
+            "M",
+            "__d(\"M\", [], (function(t, n, r, o, a, i, l) {\n\
+             \x20 var h = 1;\n  function f(t) { return t > 4 }\n  l.check = f;\n}), 98)\n",
+        )]);
+        let nl = loader(&[(
+            "M",
+            "__d(\"M\", [], (function(e, s, d, f, g, h, j) {\n\
+             \x20 var y = 1;\n  function q(n) { return n > 5 }\n  j.check = q;\n}), 98)\n",
+        )]);
+
+        let opts = DiffOptions {
+            semantic: true,
+            ..Default::default()
+        };
+        let d = diff_bundles(&old, &ol, &new, &nl, &keep_all(), &opts).unwrap();
+        let c = &d.changes[0];
+        assert_eq!(c.verdict, Some(shape::Verdict::Changed));
+        assert!(!c.noise_only);
+        assert_eq!(
+            c.functions_changed,
+            vec!["check"],
+            "named, not just counted"
+        );
     }
 
     #[test]

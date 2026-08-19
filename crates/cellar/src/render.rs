@@ -315,6 +315,38 @@ pub fn diff_text(v: &Value) {
                 n(c, "linesRemoved")
             );
         }
+        // The line counts above measure the text; this measures the program.
+        // Printed second so the two read as claim and correction where they
+        // disagree, which on a minified bundle is most of the time.
+        if let Some(verdict) = c.get("verdict").and_then(Value::as_str) {
+            match verdict {
+                "renamedOnly" => {
+                    println!("  renamed only — the text differs, the program does not")
+                }
+                "unknown" => {
+                    println!("  unparseable, so no verdict is offered rather than guessed")
+                }
+                _ => {
+                    if let Some(total) = c.get("functionsTotal").and_then(Value::as_u64) {
+                        let kept = c.get("functionsKept").and_then(Value::as_u64).unwrap_or(0);
+                        println!(
+                            "  {} of {total} functions changed",
+                            total.saturating_sub(kept)
+                        );
+                    }
+                    for (label, key) in [
+                        ("changed", "functionsChanged"),
+                        ("added", "functionsAdded"),
+                        ("removed", "functionsRemoved"),
+                    ] {
+                        let fns = arr(c, key);
+                        if !fns.is_empty() {
+                            println!("    {label}: {}", join(fns, 8));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(path) = c.get("newFile").and_then(Value::as_str) {
             println!("  new: {}/{}", s(v, "newDir"), path);
         }
