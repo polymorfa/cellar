@@ -21,6 +21,7 @@ edition = "2024"
 rust-version = "1.95"
 authors = ["Rajeh Taher <rajeh@reforward.dev>"]
 license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/polymorfa/cellar"
 homepage = "https://github.com/polymorfa/cellar"
 keywords = ["whatsapp", "reverse-engineering", "javascript", "diff", "mcp"]
