@@ -13,6 +13,7 @@ use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, Function, Program, Statement,
 };
 use oxc_ast_visit::{Visit, walk};
+use oxc_semantic::{Scoping, SymbolId, SemanticBuilder};
 
 /// The Metro module-definition function.
 pub const DEFINE_FN: &str = "__d";
@@ -58,6 +59,8 @@ pub struct ModuleFacts {
 /// Returns `None` when the program is not a module definition, which is a real
 /// case (bundle bootstrap code) and not an error.
 pub fn facts_of_module(program: &Program<'_>) -> Option<ModuleFacts> {
+    let semantic = SemanticBuilder::new().build(program).semantic;
+    let scoping = semantic.scoping();
     for stmt in &program.body {
         let Statement::ExpressionStatement(es) = stmt else {
             continue;
@@ -90,7 +93,7 @@ pub fn facts_of_module(program: &Program<'_>) -> Option<ModuleFacts> {
         }
 
         if let Some(factory) = factory_function(&call.arguments[2]) {
-            let mut scan = FactoryScan::new(factory);
+            let mut scan = FactoryScan::new(factory, scoping);
             if let Some(body) = &factory.body {
                 scan.visit_function_body(body);
                 scan.collect_top_level(body);
@@ -124,35 +127,30 @@ fn factory_function<'b, 'a>(arg: &'b Argument<'a>) -> Option<&'b Function<'a>> {
     }
 }
 
-/// Name of a simple identifier parameter at `position`, if it is one.
-fn param_name<'a>(factory: &Function<'a>, position: usize) -> Option<&'a str> {
-    let param = factory.params.items.get(position)?;
-    match &param.pattern {
-        BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
-        _ => None,
-    }
+fn symbol(scoping: &Scoping, id: &oxc_ast::ast::IdentifierReference<'_>) -> Option<SymbolId> {
+    id.reference_id.get().and_then(|id| scoping.get_reference(id).symbol_id())
 }
 
 /// Which identifiers have properties assigned onto them, split by whether the
 /// property was `exports`.
-#[derive(Default)]
-struct Assigned<'a> {
+struct Assigned<'s> {
+    scoping: &'s Scoping,
     /// `X.exports = …` — X is the module object.
-    dot_exports: Vec<&'a str>,
+    dot_exports: Vec<SymbolId>,
     /// `X.anythingElse = …` — X is a candidate exports object.
-    other: Vec<&'a str>,
+    other: Vec<SymbolId>,
 }
 
-impl<'a> Visit<'a> for Assigned<'a> {
+impl<'a> Visit<'a> for Assigned<'_> {
     fn visit_assignment_expression(&mut self, e: &oxc_ast::ast::AssignmentExpression<'a>) {
         if let Some(member) = e.left.as_member_expression()
             && let Some(prop) = member.static_property_name()
         {
             match member.object() {
                 Expression::Identifier(obj) if prop == "exports" => {
-                    self.dot_exports.push(obj.name.as_str())
+                    if let Some(id) = symbol(self.scoping,obj) { self.dot_exports.push(id) }
                 }
-                Expression::Identifier(obj) => self.other.push(obj.name.as_str()),
+                Expression::Identifier(obj) => if let Some(id) = symbol(self.scoping,obj) { self.other.push(id) },
                 // `X.exports.prop = …`. The object is itself a member
                 // expression, so the plain identifier case never sees it, and
                 // without this the one form that most clearly identifies the
@@ -162,7 +160,7 @@ impl<'a> Visit<'a> for Assigned<'a> {
                         && inner.static_property_name() == Some("exports")
                         && let Expression::Identifier(obj) = inner.object()
                     {
-                        self.dot_exports.push(obj.name.as_str());
+                        if let Some(id) = symbol(self.scoping,obj) { self.dot_exports.push(id) };
                     }
                 }
             }
@@ -171,16 +169,17 @@ impl<'a> Visit<'a> for Assigned<'a> {
     }
 }
 
-struct FactoryScan<'a> {
+struct FactoryScan<'s> {
+    scoping: &'s Scoping,
     /// The binding the factory receives `exports` as, e.g. `e`.
-    exports_binding: Option<&'a str>,
+    exports_binding: Option<SymbolId>,
     /// The binding the factory receives `module` as, e.g. `m`.
-    module_binding: Option<&'a str>,
+    module_binding: Option<SymbolId>,
     exports: Vec<String>,
     functions: Vec<String>,
 }
 
-impl<'a> FactoryScan<'a> {
+impl<'s> FactoryScan<'s> {
     /// Decide which parameters are `module` and `exports`, in that order of
     /// confidence: what the factory calls them, what it does with them, and only
     /// then where they sit.
@@ -190,42 +189,42 @@ impl<'a> FactoryScan<'a> {
     /// object is the one with properties hung off it, and `module` is the one
     /// carrying `.exports` — so it stays right across bundler versions and
     /// across the two conventions this bundle mixes.
-    fn new(factory: &Function<'a>) -> Self {
+    fn new(factory: &Function<'_>, scoping: &'s Scoping) -> Self {
         let named = |want: &str| {
             factory.params.items.iter().find_map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) if id.name == want => Some(id.name.as_str()),
+                BindingPattern::BindingIdentifier(id) if id.name == want => id.symbol_id.get(),
                 _ => None,
             })
         };
 
-        let params: Vec<Option<&str>> = factory
+        let params: Vec<Option<SymbolId>> = factory
             .params
             .items
             .iter()
             .map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
                 _ => None,
             })
             .collect();
 
-        let mut assigned = Assigned::default();
+        let mut assigned = Assigned { scoping, dot_exports: vec![], other: vec![] };
         if let Some(body) = &factory.body {
             assigned.visit_function_body(body);
         }
-        let slot = |name: &str| params.iter().position(|p| *p == Some(name));
+        let slot = |id: &SymbolId| params.iter().position(|p| *p == Some(*id));
 
         // `X.exports = …` identifies `module`, never `exports`.
-        let by_module = assigned.dot_exports.iter().filter_map(|n| slot(n)).max();
+        let by_module = assigned.dot_exports.iter().filter_map(slot).max();
         // Everything else identifies `exports`. The later slot wins, because
         // `module` precedes `exports` in every convention and a module writing
         // to both is exporting through both.
-        let by_exports = assigned.other.iter().filter_map(|n| slot(n)).max();
+        let by_exports = assigned.other.iter().filter_map(slot).max();
 
         let (m, e) =
             module_and_exports(factory.params.items.len()).unwrap_or((usize::MAX, usize::MAX));
         Self {
+            scoping,
             exports_binding: named("exports")
-                .or_else(|| by_exports.and_then(|i| params[i]))
                 // `exports` always immediately follows `module`, so knowing one
                 // gives the other. This matters because arity cannot separate
                 // the six-parameter convention plus an injected dependency from
@@ -233,10 +232,11 @@ impl<'a> FactoryScan<'a> {
                 // seven parameters of the former, and reading it by arity looks
                 // for exports on the injected `fbt` and finds none.
                 .or_else(|| by_module.and_then(|i| params.get(i + 1).copied().flatten()))
-                .or_else(|| param_name(factory, e)),
+                .or_else(|| by_exports.and_then(|i| params[i]))
+                .or_else(|| params.get(e).copied().flatten()),
             module_binding: named("module")
                 .or_else(|| by_module.and_then(|i| params[i]))
-                .or_else(|| param_name(factory, m)),
+                .or_else(|| params.get(m).copied().flatten()),
             exports: Vec::new(),
             functions: Vec::new(),
         }
@@ -244,7 +244,7 @@ impl<'a> FactoryScan<'a> {
 
     /// Top-level declarations of the factory body — the module's own functions,
     /// as opposed to every closure nested anywhere inside it.
-    fn collect_top_level(&mut self, body: &oxc_ast::ast::FunctionBody<'a>) {
+    fn collect_top_level(&mut self, body: &oxc_ast::ast::FunctionBody<'_>) {
         for stmt in &body.statements {
             match stmt {
                 Statement::FunctionDeclaration(f) => {
@@ -280,7 +280,7 @@ impl<'a> FactoryScan<'a> {
 
     /// `<exports>.name = …` → `name`; `<module>.exports = …` → `default`;
     /// `<module>.exports.name = …` → `name`.
-    fn record_export_target(&mut self, target: &AssignmentTarget<'a>) {
+    fn record_export_target(&mut self, target: &AssignmentTarget<'_>) {
         let Some(member) = target.as_member_expression() else {
             return;
         };
@@ -290,7 +290,7 @@ impl<'a> FactoryScan<'a> {
 
         // `<exports>.prop = …`
         if let Expression::Identifier(obj) = member.object()
-            && Some(obj.name.as_str()) == self.exports_binding
+            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.exports_binding
         {
             self.exports.push(prop.to_string());
             return;
@@ -298,7 +298,7 @@ impl<'a> FactoryScan<'a> {
 
         // `<module>.exports = …`
         if let Expression::Identifier(obj) = member.object()
-            && Some(obj.name.as_str()) == self.module_binding
+            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.module_binding
             && prop == "exports"
         {
             self.exports.push("default".to_string());
@@ -309,14 +309,14 @@ impl<'a> FactoryScan<'a> {
         if let Some(inner) = member.object().as_member_expression()
             && inner.static_property_name() == Some("exports")
             && let Expression::Identifier(obj) = inner.object()
-            && Some(obj.name.as_str()) == self.module_binding
+            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.module_binding
         {
             self.exports.push(prop.to_string());
         }
     }
 }
 
-impl<'a> Visit<'a> for FactoryScan<'a> {
+impl<'a> Visit<'a> for FactoryScan<'_> {
     fn visit_assignment_expression(&mut self, expr: &oxc_ast::ast::AssignmentExpression<'a>) {
         self.record_export_target(&expr.left);
         walk::walk_assignment_expression(self, expr);
@@ -336,6 +336,16 @@ mod tests {
         facts_of_module(&ret.program).expect("a module definition")
     }
 
+    #[test]
+    fn block_shadow_and_captured_exports_are_distinct() {
+        let f=facts("__d('M',[],function(g,r,i,n,l,m,e){ {let e={};e.tmp=1} function f(){e.real=1} })");
+        assert_eq!(f.exports,vec!["real"]);
+    }
+    #[test]
+    fn nested_parameter_shadow_does_not_select_exports() {
+        let f=facts("__d('M',[],function(g,r,i,n,l,m,e){function f(e){e.tmp=1}m.real=1})");
+        assert_eq!(f.exports,vec!["real"]);
+    }
     #[test]
     fn reads_name_and_positional_deps() {
         let f = facts(r#"__d("WAWebFoo",["A","B"],function(g,r,i,a,m,e,d){},1);"#);

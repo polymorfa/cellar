@@ -330,7 +330,7 @@ pub fn diff_text(v: &Value) {
                     if let Some(total) = c.get("functionsTotal").and_then(Value::as_u64) {
                         let kept = c.get("functionsKept").and_then(Value::as_u64).unwrap_or(0);
                         println!(
-                            "  {} of {total} functions changed",
+                            "  {} of {total} localized functions changed",
                             total.saturating_sub(kept)
                         );
                     }
@@ -408,6 +408,16 @@ pub fn diff_markdown(v: &Value) {
             }
             if !arr(c, "exportsAdded").is_empty() {
                 println!("- exports added: {}", join(arr(c, "exportsAdded"), 20));
+            }
+            if let Some(verdict) = c.get("verdict").and_then(Value::as_str) {
+                println!("- semantic verdict: `{verdict}`");
+                if let Some(total) = c.get("functionsTotal").and_then(Value::as_u64) {
+                    let kept = c.get("functionsKept").and_then(Value::as_u64).unwrap_or(0);
+                    println!("- {} of {total} localized functions changed", total.saturating_sub(kept));
+                }
+                for (label,key) in [("changed","functionsChanged"),("added","functionsAdded"),("removed","functionsRemoved")] {
+                    if !arr(c,key).is_empty() { println!("- {label}: {}",join(arr(c,key),20)); }
+                }
             }
             if let Some(h) = c.get("hunks").and_then(Value::as_str) {
                 println!("\n```diff\n{h}\n```");

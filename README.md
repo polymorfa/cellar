@@ -135,3 +135,9 @@ Copyright (c) 2026 Rajeh Taher
 Copyright (c) 2026 Polymorfa (Softium LLC)
 
 Licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
+
+## Semantic diffs
+
+Run `cellar diff OLD NEW --semantic` to compare local bindings without treating a rename as a program change. Free names, literals, declaration kinds, async/generator flags and optional access remain significant. Parse diagnostics produce an `unknown` verdict. Semantic classification covers the primary definition and stored variants even when the textual diff exceeds `maxDiffBytes`.
+
+Text, JSON and Markdown reports include the verdict and localized function names. Changed enclosing functions are collapsed when an inner edit explains them; whole function additions and removals retain their outer name. Counts describe this localized report. `--include-noise-only` also shows modules classified as rename-only.

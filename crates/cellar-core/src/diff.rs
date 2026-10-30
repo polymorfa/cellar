@@ -292,12 +292,25 @@ pub fn diff_bundles(
                         "module exceeds maxDiffBytes ({} bytes); old={} new={}",
                         opts.max_diff_bytes, o.stored_len, n.stored_len
                     ));
-                } else {
+                }
+                if !too_big || opts.semantic {
                     let old_text = old_src.load(o)?;
                     let new_text = new_src.load(n)?;
-                    apply_text_diff(&mut change, &old_text, &new_text, filter, opts);
+                    if !too_big { apply_text_diff(&mut change, &old_text, &new_text, filter, opts); }
                     if opts.semantic {
-                        apply_semantic_diff(&mut change, &old_text, &new_text);
+                        if o.variants.is_empty() && n.variants.is_empty() {
+                            apply_semantic_diff(&mut change, &old_text, &new_text);
+                        } else {
+                            let definitions = |entry: &ModuleEntry, primary: String, loader: &dyn SourceLoader| -> Result<Vec<String>> {
+                                let mut texts = vec![primary];
+                                for variant in &entry.variants {
+                                    let mut v = entry.clone(); v.file = variant.file.clone(); v.raw_sha256 = variant.sha256.clone();
+                                    texts.push(loader.load(&v)?);
+                                }
+                                Ok(texts)
+                            };
+                            apply_definition_diff(&mut change, definitions(o, old_text, old_src)?, definitions(n,new_text,new_src)?);
+                        }
                     }
                 }
 
@@ -306,8 +319,10 @@ pub fn diff_bundles(
                 // comparison knows the two programs are the same one, whatever
                 // the lines say. Where they disagree, take the proof — that is
                 // the whole reason for computing it.
-                if change.verdict == Some(shape::Verdict::RenamedOnly) {
-                    change.noise_only = true;
+                match change.verdict {
+                    Some(shape::Verdict::RenamedOnly) => change.noise_only = true,
+                    Some(shape::Verdict::Changed | shape::Verdict::Unknown) => change.noise_only = false,
+                    _ => {}
                 }
                 if change.noise_only {
                     summary.noise_only += 1;
@@ -419,6 +434,34 @@ fn apply_semantic_diff(change: &mut ModuleChange, old_text: &str, new_text: &str
     change.functions_total = Some(d.total as u32);
 }
 
+// Compare the complete definition multiset, not only whichever copy was primary.
+// Exact canonical matches are removed before pairing remaining changed definitions.
+fn apply_definition_diff(change: &mut ModuleChange, old: Vec<String>, new: Vec<String>) {
+    let shapes = |texts: Vec<String>| -> Option<Vec<(String,String)>> {
+        texts.into_iter().map(|text| shape::shape(&text).map(|s| (s.hash,text))).collect()
+    };
+    let (Some(mut old), Some(mut new)) = (shapes(old),shapes(new)) else {
+        change.verdict = Some(shape::Verdict::Unknown); return;
+    };
+    old.sort(); new.sort();
+    new.retain(|(hash,_)| {
+        if let Some(i) = old.iter().position(|(h,_)| h==hash) { old.remove(i); false } else { true }
+    });
+    if old.is_empty() && new.is_empty() { change.verdict=Some(shape::Verdict::RenamedOnly); return; }
+    change.verdict=Some(shape::Verdict::Changed);
+    let mut kept=0; let mut total=0;
+    for i in 0..old.len().max(new.len()) {
+        let a=old.get(i).map(|(_,t)| t.as_str()).unwrap_or("");
+        let b=new.get(i).map(|(_,t)| t.as_str()).unwrap_or("");
+        let d=shape::diff_functions(a,b); kept+=d.kept; total+=d.total;
+        let prefix=|label: &str| format!("definition {}/{label}",i+1);
+        change.functions_changed.extend(d.changed.iter().map(|c| prefix(&c.label)));
+        change.functions_added.extend(d.added.iter().map(|f| prefix(&f.label)));
+        change.functions_removed.extend(d.removed.iter().map(|f| prefix(&f.label)));
+    }
+    change.functions_kept=Some(kept as u32); change.functions_total=Some(total as u32);
+}
+
 fn apply_text_diff(
     change: &mut ModuleChange,
     old_text: &str,
@@ -516,6 +559,29 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn semantic_runs_above_hunk_cap_and_overrides_line_noise() {
+        let a=idx(1,vec![entry("M","a",&[],2048)]);let b=idx(2,vec![entry("M","b",&[],2048)]);
+        let opts=DiffOptions{semantic:true,max_diff_bytes:1,..Default::default()};
+        let d=diff_bundles(&a,&loader(&[("M","var a=babelHelpers.x")]),&b,&loader(&[("M","const a=babelHelpers.x")]),&keep_all(),&opts).unwrap();
+        assert_eq!(d.changes.len(),1);let m=&d.changes[0];assert!(m.hunks_omitted.is_some());
+        assert_eq!(m.verdict,Some(shape::Verdict::Changed));assert!(!m.noise_only);
+    }
+    #[test]
+    fn semantic_compares_primary_and_variants() {
+        use crate::model::ModuleVariant;
+        struct Files(BTreeMap<String,String>);
+        impl SourceLoader for Files { fn load(&self,e:&ModuleEntry)->Result<String>{Ok(self.0[&e.file].clone())} }
+        let mut a=entry("M","primary",&[],10);let mut b=a.clone();
+        a.variants.push(ModuleVariant{sha256:"a".into(),file:"old.js".into(),raw_len:10,deps_added:vec![],deps_removed:vec![]});
+        b.variants.push(ModuleVariant{sha256:"b".into(),file:"new.js".into(),raw_len:10,deps_added:vec![],deps_removed:vec![]});
+        let files=Files(BTreeMap::from([("modules/M.js".into(),"var e={};e.primary=function(){return 0}".into()),("old.js".into(),"var e={};e.variant=function(){return 1}".into()),("new.js".into(),"var e={};e.variant=function(){return 2}".into())]));
+        let d=diff_bundles(&idx(1,vec![a.clone()]),&files,&idx(2,vec![b.clone()]),&files,&keep_all(),&DiffOptions{semantic:true,..Default::default()}).unwrap();
+        assert_eq!(d.changes[0].verdict,Some(shape::Verdict::Changed));assert!(d.changes[0].functions_changed.iter().any(|s| s.ends_with("/variant")));
+        b.variants.clear();let d=diff_bundles(&idx(1,vec![a]),&files,&idx(2,vec![b]),&files,&keep_all(),&DiffOptions{semantic:true,..Default::default()}).unwrap();
+        assert_eq!(d.changes[0].verdict,Some(shape::Verdict::Changed));assert!(!d.changes[0].functions_removed.is_empty());
+    }
     fn keep_all() -> FilterSet {
         FilterSet::compile(Filter {
             name: "all".into(),
