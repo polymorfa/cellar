@@ -132,5 +132,6 @@ If you'd like to financially support this project, you can do so
 ## License
 
 Copyright (c) 2026 Rajeh Taher
+Copyright (c) 2026 Polymorfa (Softium LLC)
 
 Licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
