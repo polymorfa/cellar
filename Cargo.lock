@@ -133,6 +133,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_parser",
+ "oxc_semantic",
+ "oxc_span",
  "rayon",
  "regex",
  "serde",

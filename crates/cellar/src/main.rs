@@ -286,6 +286,14 @@ struct DiffArgs {
     /// Include modules whose only changes are transpiler churn.
     #[arg(long)]
     include_noise: bool,
+    /// Tell a rename from a real change, and name the functions that changed.
+    ///
+    /// Compares each changed module with its local names erased. A minifier
+    /// names by position, so inserting one binding renames every local after it
+    /// — the dominant form of noise in a bundle, and one no line-level rule can
+    /// recognise, because renamed code looks exactly like code.
+    #[arg(long)]
+    semantic: bool,
     /// Context lines in each hunk.
     #[arg(long, short = 'C', default_value_t = 3)]
     context: usize,
@@ -565,6 +573,7 @@ fn diff(ctx: &Ctx, args: DiffArgs) -> Result<()> {
         include_hunks: !args.no_hunks,
         context_lines: args.context,
         include_noise_only: args.include_noise,
+        semantic: args.semantic,
         ..DiffOptions::default()
     };
     let value = ctx.diff(&old, &new, Some(&args.filter), &opts, args.limit)?;
