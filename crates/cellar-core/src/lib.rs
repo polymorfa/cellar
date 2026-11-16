@@ -20,6 +20,7 @@
 
 pub mod builtin;
 pub mod diff;
+pub mod factory;
 pub mod filter;
 pub mod graph;
 pub mod model;

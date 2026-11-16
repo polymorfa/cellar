@@ -7,8 +7,9 @@
 //! factory's *parameters* instead makes "assignment onto exports" a question
 //! about a binding, and it stays correct whatever the minifier named it — as
 //! long as the right parameter is picked, which is not stock Metro's. See
-//! [`module_and_exports`].
+//! [`cellar_core::factory::module_and_exports`], shared with the shape engine.
 
+use cellar_core::factory;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, Function, Program, Statement,
 };
@@ -17,30 +18,6 @@ use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
 
 /// The Metro module-definition function.
 pub const DEFINE_FN: &str = "__d";
-
-/// Where `module` and `exports` sit, for a factory of this many parameters.
-///
-/// Stock Metro passes seven parameters and puts `exports` fifth. This bundle is
-/// Meta's own fork and does neither. A small number of its modules ship
-/// unminified and spell the signature out, which is where these come from — over
-/// one revision, 135 modules name their parameters, in two shapes:
-///
-/// ```text
-/// 133×  (global, require, requireDynamic, requireLazy, module, exports)
-///   2×  (global, require, importDefault, importNamespace, requireLazy, module, exports, …)
-/// ```
-///
-/// Anything after `exports` in the long form is a dependency the loader injects
-/// directly — the two unminified examples receive `invariant` and `fbt` that way
-/// — so `exports` is *not* the last parameter, and treating it as one silently
-/// loses the exports of every `.react` module, about a fifth of the bundle.
-fn module_and_exports(arity: usize) -> Option<(usize, usize)> {
-    match arity {
-        6 => Some((4, 5)),
-        7.. => Some((5, 6)),
-        _ => None,
-    }
-}
 
 /// What one module declares.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -133,52 +110,6 @@ fn symbol(scoping: &Scoping, id: &oxc_ast::ast::IdentifierReference<'_>) -> Opti
         .and_then(|id| scoping.get_reference(id).symbol_id())
 }
 
-/// Which identifiers have properties assigned onto them, split by whether the
-/// property was `exports`.
-struct Assigned<'s> {
-    scoping: &'s Scoping,
-    /// `X.exports = …` — X is the module object.
-    dot_exports: Vec<SymbolId>,
-    /// `X.anythingElse = …` — X is a candidate exports object.
-    other: Vec<SymbolId>,
-}
-
-impl<'a> Visit<'a> for Assigned<'_> {
-    fn visit_assignment_expression(&mut self, e: &oxc_ast::ast::AssignmentExpression<'a>) {
-        if let Some(member) = e.left.as_member_expression()
-            && let Some(prop) = member.static_property_name()
-        {
-            match member.object() {
-                Expression::Identifier(obj) if prop == "exports" => {
-                    if let Some(id) = symbol(self.scoping, obj) {
-                        self.dot_exports.push(id)
-                    }
-                }
-                Expression::Identifier(obj) => {
-                    if let Some(id) = symbol(self.scoping, obj) {
-                        self.other.push(id)
-                    }
-                }
-                // `X.exports.prop = …`. The object is itself a member
-                // expression, so the plain identifier case never sees it, and
-                // without this the one form that most clearly identifies the
-                // module object was the one form that identified nothing.
-                other => {
-                    if let Some(inner) = other.as_member_expression()
-                        && inner.static_property_name() == Some("exports")
-                        && let Expression::Identifier(obj) = inner.object()
-                    {
-                        if let Some(id) = symbol(self.scoping, obj) {
-                            self.dot_exports.push(id)
-                        };
-                    }
-                }
-            }
-        }
-        walk::walk_assignment_expression(self, e);
-    }
-}
-
 struct FactoryScan<'s> {
     scoping: &'s Scoping,
     /// The binding the factory receives `exports` as, e.g. `e`.
@@ -190,67 +121,12 @@ struct FactoryScan<'s> {
 }
 
 impl<'s> FactoryScan<'s> {
-    /// Decide which parameters are `module` and `exports`, in that order of
-    /// confidence: what the factory calls them, what it does with them, and only
-    /// then where they sit.
-    ///
-    /// Position is the weakest of the three and is why this is not simply a pair
-    /// of constants. Behaviour is a fact about *this* module — the exports
-    /// object is the one with properties hung off it, and `module` is the one
-    /// carrying `.exports` — so it stays right across bundler versions and
-    /// across the two conventions this bundle mixes.
     fn new(factory: &Function<'_>, scoping: &'s Scoping) -> Self {
-        let named = |want: &str| {
-            factory.params.items.iter().find_map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) if id.name == want => id.symbol_id.get(),
-                _ => None,
-            })
-        };
-
-        let params: Vec<Option<SymbolId>> = factory
-            .params
-            .items
-            .iter()
-            .map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-                _ => None,
-            })
-            .collect();
-
-        let mut assigned = Assigned {
-            scoping,
-            dot_exports: vec![],
-            other: vec![],
-        };
-        if let Some(body) = &factory.body {
-            assigned.visit_function_body(body);
-        }
-        let slot = |id: &SymbolId| params.iter().position(|p| *p == Some(*id));
-
-        // `X.exports = …` identifies `module`, never `exports`.
-        let by_module = assigned.dot_exports.iter().filter_map(slot).max();
-        // Everything else identifies `exports`. The later slot wins, because
-        // `module` precedes `exports` in every convention and a module writing
-        // to both is exporting through both.
-        let by_exports = assigned.other.iter().filter_map(slot).max();
-
-        let (m, e) =
-            module_and_exports(factory.params.items.len()).unwrap_or((usize::MAX, usize::MAX));
+        let bindings = factory::module_and_exports(factory, scoping);
         Self {
             scoping,
-            exports_binding: named("exports")
-                // `exports` always immediately follows `module`, so knowing one
-                // gives the other. This matters because arity cannot separate
-                // the six-parameter convention plus an injected dependency from
-                // the seven-parameter convention — `GeminiEmojiCategories` is
-                // seven parameters of the former, and reading it by arity looks
-                // for exports on the injected `fbt` and finds none.
-                .or_else(|| by_module.and_then(|i| params.get(i + 1).copied().flatten()))
-                .or_else(|| by_exports.and_then(|i| params[i]))
-                .or_else(|| params.get(e).copied().flatten()),
-            module_binding: named("module")
-                .or_else(|| by_module.and_then(|i| params[i]))
-                .or_else(|| params.get(m).copied().flatten()),
+            exports_binding: bindings.exports,
+            module_binding: bindings.module,
             exports: Vec::new(),
             functions: Vec::new(),
         }
@@ -364,6 +240,15 @@ mod tests {
     fn nested_parameter_shadow_does_not_select_exports() {
         let f = facts("__d('M',[],function(g,r,i,n,l,m,e){function f(e){e.tmp=1}m.real=1})");
         assert_eq!(f.exports, vec!["real"]);
+    }
+    /// A property written onto `global` or `require` is not an export, even
+    /// when the module writes to nothing else.
+    #[test]
+    fn writes_to_loader_parameters_are_not_exports() {
+        let f = facts("__d('M',[],function(t,n,r,o,a,i,l){t.__DEV__=1;n.cache=2})");
+        assert!(f.exports.is_empty(), "{:?}", f.exports);
+        let f = facts("__d('M',[],function(t,n,r,o,a,i){t.exports=1})");
+        assert!(f.exports.is_empty(), "{:?}", f.exports);
     }
     #[test]
     fn reads_name_and_positional_deps() {
