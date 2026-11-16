@@ -38,13 +38,13 @@ use oxc_allocator::Allocator;
 use oxc_ast::{AstKind, ast::*};
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
-use oxc_semantic::{Scoping, SymbolId};
-use oxc_span::SourceType;
+use oxc_semantic::{AstNodes, NodeId, Scoping, Semantic, SemanticBuilder, SymbolId};
+use oxc_span::{SourceType, Span};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::diff::SourceLoader;
+use crate::factory;
 use crate::model::ModuleEntry;
 
 /// A module's structure, with local names erased.
@@ -56,6 +56,39 @@ pub struct Shape {
     pub tokens: usize,
 }
 
+/// Parse and bind a module, or `None` if the parser reported anything at all.
+///
+/// Oxc recovers from many errors and hands back a best-effort tree with
+/// diagnostics attached. Hashing that tree would compare two guesses, and two
+/// malformed revisions that recover to the same guess would come back
+/// `renamedOnly` and be suppressed as noise. Any diagnostic is therefore
+/// treated as "does not parse".
+fn analyze<R>(src: &str, f: impl FnOnce(&Program<'_>, &Semantic<'_>) -> R) -> Option<R> {
+    let alloc = Allocator::default();
+    let parsed = Parser::new(&alloc, src, SourceType::cjs()).parse();
+    if parsed.panicked || !parsed.diagnostics.is_empty() {
+        return None;
+    }
+    // Symbol ids are what make a rename invisible, and they only exist once the
+    // binder has run.
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .build(&parsed.program)
+        .semantic;
+    Some(f(&parsed.program, &semantic))
+}
+
+/// A nested function left out of an enclosing function's canonical stream.
+#[derive(Debug, Clone, Copy)]
+struct Excised {
+    start: u32,
+    end: u32,
+    /// Changed on both sides: stands in as one placeholder token, so the
+    /// enclosing body keeps its structure. Added or removed: dropped entirely,
+    /// because it exists on one side only.
+    placeholder: bool,
+}
+
 struct Canon<'s> {
     scoping: &'s Scoping,
     out: String,
@@ -63,7 +96,11 @@ struct Canon<'s> {
     /// symbol -> the order it was first seen. A minifier's choice of letter is
     /// not information; the position in the binding order is.
     seen: HashMap<SymbolId, u32>,
-    function_span: Option<oxc_span::Span>,
+    /// The function being shaped on its own. A binding declared outside it is a
+    /// capture, encoded by [`capture_keys`] rather than by ordinal.
+    root: Option<Span>,
+    captures: Option<&'s HashMap<SymbolId, String>>,
+    excise: &'s [Excised],
 }
 
 impl<'s> Canon<'s> {
@@ -73,13 +110,20 @@ impl<'s> Canon<'s> {
             out: String::new(),
             tokens: 0,
             seen: HashMap::new(),
-            function_span: None,
+            root: None,
+            captures: None,
+            excise: &[],
         }
     }
 
-    fn for_function(scoping: &'s Scoping, span: oxc_span::Span) -> Self {
+    fn for_function(
+        scoping: &'s Scoping,
+        span: Span,
+        captures: &'s HashMap<SymbolId, String>,
+    ) -> Self {
         Self {
-            function_span: Some(span),
+            root: Some(span),
+            captures: Some(captures),
             ..Self::new(scoping)
         }
     }
@@ -95,11 +139,20 @@ impl<'s> Canon<'s> {
             // Bound here: emit its ordinal, so `y` and `C` are the same thing
             // when they occupy the same position in the binding order.
             Some(id) => {
-                if self.function_span.is_some_and(|span| {
+                if self.root.is_some_and(|span| {
                     let declared = self.scoping.symbol_span(id);
                     declared.start < span.start || declared.end > span.end
                 }) {
-                    self.push(&format!("capture{}", id.index()));
+                    // A capture. Its ordinal inside this function says nothing
+                    // about *which* outer binding it is, and its symbol index
+                    // shifts with every declaration inserted earlier in the
+                    // module; the key describes the binding instead.
+                    let key = self
+                        .captures
+                        .and_then(|c| c.get(&id))
+                        .map_or("capture", String::as_str)
+                        .to_string();
+                    self.push(&key);
                     return;
                 }
                 let next = self.seen.len() as u32;
@@ -111,6 +164,140 @@ impl<'s> Canon<'s> {
             None => self.push(&format!("@{name}")),
         }
     }
+
+    /// Whether a nested function is left out of this stream, and how.
+    fn excised(&self, span: Span) -> Option<Excised> {
+        if self.root == Some(span) {
+            return None;
+        }
+        self.excise
+            .iter()
+            .find(|x| x.start == span.start && x.end == span.end)
+            .copied()
+    }
+
+    fn emit_excised(&mut self, x: Excised) {
+        if x.placeholder {
+            self.push("fn-changed");
+            self.push(")");
+        }
+    }
+}
+
+fn reference_symbol(scoping: &Scoping, r: &IdentifierReference<'_>) -> Option<SymbolId> {
+    r.reference_id
+        .get()
+        .and_then(|id| scoping.get_reference(id).symbol_id())
+}
+
+fn param_index(nodes: &AstNodes<'_>, node: NodeId, span: Span) -> Option<usize> {
+    match nodes.parent_kind(node) {
+        AstKind::FormalParameters(ps) => ps.items.iter().position(|p| p.span == span),
+        _ => None,
+    }
+}
+
+/// What a binding's initializer says about the binding, minus any local name.
+fn init_descriptor(init: Option<&Expression<'_>>, semantic: &Semantic<'_>) -> String {
+    let Some(init) = init else {
+        return "none".into();
+    };
+    match init.get_inner_expression() {
+        // `r("WAWebWid")`: the dependency it binds is the stable part.
+        Expression::CallExpression(c) => {
+            let callee = match c.callee.get_inner_expression() {
+                Expression::Identifier(r) => match reference_symbol(semantic.scoping(), r) {
+                    None => format!("@{}", r.name),
+                    Some(s) => {
+                        let node = semantic.scoping().symbol_declaration(s);
+                        match semantic.nodes().kind(node) {
+                            AstKind::FormalParameter(p) => {
+                                match param_index(semantic.nodes(), node, p.span) {
+                                    Some(i) => format!("p{i}"),
+                                    None => "local".into(),
+                                }
+                            }
+                            _ => "local".into(),
+                        }
+                    }
+                },
+                Expression::StaticMemberExpression(m) => format!(".{}", m.property.name),
+                _ => "expr".into(),
+            };
+            let arg = match c.arguments.first().and_then(Argument::as_expression) {
+                Some(Expression::StringLiteral(s)) => format!("{:?}", s.value.as_str()),
+                _ => String::new(),
+            };
+            format!("call({callee}){arg}")
+        }
+        Expression::StringLiteral(s) => format!("s{:?}", s.value.as_str()),
+        Expression::NumericLiteral(n) => format!("n{}", n.value),
+        Expression::BooleanLiteral(b) => format!("b{}", b.value),
+        Expression::NullLiteral(_) => "null".into(),
+        Expression::FunctionExpression(f) => format!("fn{}", f.params.items.len()),
+        Expression::ArrowFunctionExpression(f) => format!("fn{}", f.params.items.len()),
+        Expression::ClassExpression(_) => "class".into(),
+        other => format!("{:?}", std::mem::discriminant(other)),
+    }
+}
+
+/// A stable name for every binding, for use when a function captures it.
+///
+/// A function shaped on its own cannot number the outer bindings it refers to:
+/// a fresh numbering calls `return a()` and `return b()` the same program, and
+/// the parser's symbol index shifts whenever a declaration is inserted earlier
+/// in the module, which is exactly the rename cascade this engine exists to
+/// absorb. So a captured binding is described by what survives minification —
+/// the name it is exported under, the dependency it was bound to, its parameter
+/// slot, the literal it holds — at its scope depth, plus its rank among
+/// same-described bindings in the same scope. Only inserting a binding with an
+/// identical description earlier in the same scope moves a key.
+fn capture_keys(
+    semantic: &Semantic<'_>,
+    exported: &HashMap<SymbolId, String>,
+) -> HashMap<SymbolId, String> {
+    let scoping = semantic.scoping();
+    let nodes = semantic.nodes();
+    let mut described: Vec<(String, oxc_semantic::ScopeId, u32, SymbolId)> = Vec::new();
+    for id in scoping.symbol_ids() {
+        let base = match exported.get(&id) {
+            Some(name) => format!("export:{name}"),
+            None => {
+                let node = scoping.symbol_declaration(id);
+                match nodes.kind(node) {
+                    AstKind::VariableDeclarator(d) => {
+                        let kind = match nodes.parent_kind(node) {
+                            AstKind::VariableDeclaration(v) => format!("{:?}", v.kind),
+                            _ => "var".into(),
+                        };
+                        format!("{kind}:{}", init_descriptor(d.init.as_ref(), semantic))
+                    }
+                    AstKind::FormalParameter(p) => match param_index(nodes, node, p.span) {
+                        Some(i) => format!("param{i}"),
+                        None => "param".into(),
+                    },
+                    AstKind::Function(f) => format!("fn{}", f.params.items.len()),
+                    AstKind::Class(_) => "class".into(),
+                    AstKind::CatchParameter(_) => "catch".into(),
+                    other => format!("{:?}", std::mem::discriminant(&other)),
+                }
+            }
+        };
+        let scope = scoping.symbol_scope_id(id);
+        described.push((base, scope, scoping.symbol_span(id).start, id));
+    }
+    described.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
+    let mut out = HashMap::with_capacity(described.len());
+    let mut rank = 0u32;
+    for (i, (base, scope, _, id)) in described.iter().enumerate() {
+        rank = match i.checked_sub(1).map(|j| &described[j]) {
+            Some((b, s, ..)) if b == base && s == scope => rank + 1,
+            _ => 0,
+        };
+        let depth = scoping.scope_ancestors(*scope).count();
+        out.insert(*id, format!("capture:{base}@{depth}#{rank}"));
+    }
+    out
 }
 
 impl<'a, 's> Visit<'a> for Canon<'s> {
@@ -149,9 +336,11 @@ impl<'a, 's> Visit<'a> for Canon<'s> {
             AstKind::Function(f) => {
                 self.push(&format!("fn{:?}:{}:{}", f.r#type, f.r#async, f.generator))
             }
-            AstKind::ArrowFunctionExpression(f) => {
-                self.push(&format!("arrow{}:{}", f.r#async, f.expression))
-            }
+            AstKind::ArrowFunctionExpression(f) => self.push(&format!(
+                "arrow{}:{}",
+                f.r#async,
+                matches!(f.body, ArrowFunctionBody::FunctionBody(_))
+            )),
             AstKind::TemplateElement(t) => {
                 self.push(&format!("template{:?}:{}", t.value.raw, t.tail))
             }
@@ -174,6 +363,33 @@ impl<'a, 's> Visit<'a> for Canon<'s> {
             AstKind::UpdateExpression(e) => {
                 self.push(&format!("op{}{}", e.operator.as_str(), e.prefix))
             }
+            // Holes have no node of their own in a pattern, so `[, a] = x` and
+            // `[a] = x` would otherwise emit the same stream.
+            AstKind::ArrayPattern(p) => self.push(&format!(
+                "arraypat{}",
+                p.elements
+                    .iter()
+                    .map(|e| if e.is_some() { '1' } else { '0' })
+                    .collect::<String>()
+            )),
+            AstKind::ArrayAssignmentTarget(p) => self.push(&format!(
+                "arraytarget{}",
+                p.elements
+                    .iter()
+                    .map(|e| if e.is_some() { '1' } else { '0' })
+                    .collect::<String>()
+            )),
+            // Likewise the three optional clauses of `for (;;)`: without
+            // markers `for (a;;)` and `for (;a;)` are the same stream.
+            AstKind::ForStatement(f) => self.push(&format!(
+                "for{}:{}:{}",
+                f.init.is_some(),
+                f.test.is_some(),
+                f.update.is_some()
+            )),
+            AstKind::AccessorProperty(p) => {
+                self.push(&format!("accessor{}:{}", p.r#static, p.computed))
+            }
             other => {
                 // The discriminant, not `debug_name()`. That helpfully embeds
                 // the identifier — `VariableDeclarator(h)` — so every parent
@@ -186,6 +402,20 @@ impl<'a, 's> Visit<'a> for Canon<'s> {
 
     fn leave_node(&mut self, _: AstKind<'a>) {
         self.push(")");
+    }
+
+    fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        match self.excised(f.span) {
+            Some(x) => self.emit_excised(x),
+            None => oxc_ast_visit::walk::walk_function(self, f, flags),
+        }
+    }
+
+    fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
+        match self.excised(f.span) {
+            Some(x) => self.emit_excised(x),
+            None => oxc_ast_visit::walk::walk_arrow_function_expression(self, f),
+        }
     }
 
     /// `!0` and `!1` are how a minifier writes `true` and `false`.
@@ -227,22 +457,13 @@ fn fnv1a(s: &str) -> String {
 
 /// The canonical shape of a module, or `None` if it does not parse.
 pub fn shape(src: &str) -> Option<Shape> {
-    let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, src, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
-        return None;
-    }
-    // Symbol ids are what make a rename invisible, and they only exist once the
-    // binder has run.
-    let semantic = SemanticBuilder::new()
-        .with_build_nodes(true)
-        .build(&parsed.program)
-        .semantic;
-    let mut c = Canon::new(semantic.scoping());
-    c.visit_program(&parsed.program);
-    Some(Shape {
-        hash: fnv1a(&c.out),
-        tokens: c.tokens,
+    analyze(src, |program, semantic| {
+        let mut c = Canon::new(semantic.scoping());
+        c.visit_program(program);
+        Shape {
+            hash: fnv1a(&c.out),
+            tokens: c.tokens,
+        }
     })
 }
 
@@ -268,23 +489,14 @@ pub enum Verdict {
 /// the work is the function — a module with sixty functions and one real edit
 /// should cost you one function to read, not sixty.
 pub fn function_shapes(src: &str) -> Vec<Shape> {
-    let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, src, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
-        return vec![];
-    }
-    let semantic = SemanticBuilder::new()
-        .with_build_nodes(true)
-        .build(&parsed.program)
-        .semantic;
-
     struct Fns<'s> {
         scoping: &'s Scoping,
+        captures: &'s HashMap<SymbolId, String>,
         out: Vec<Shape>,
     }
     impl<'a, 's> Visit<'a> for Fns<'s> {
         fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
-            let mut c = Canon::for_function(self.scoping, f.span);
+            let mut c = Canon::for_function(self.scoping, f.span, self.captures);
             c.visit_function(f, flags);
             self.out.push(Shape {
                 hash: fnv1a(&c.out),
@@ -293,7 +505,7 @@ pub fn function_shapes(src: &str) -> Vec<Shape> {
             oxc_ast_visit::walk::walk_function(self, f, flags);
         }
         fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
-            let mut c = Canon::for_function(self.scoping, f.span);
+            let mut c = Canon::for_function(self.scoping, f.span, self.captures);
             c.visit_arrow_function_expression(f);
             self.out.push(Shape {
                 hash: fnv1a(&c.out),
@@ -303,12 +515,18 @@ pub fn function_shapes(src: &str) -> Vec<Shape> {
         }
     }
 
-    let mut v = Fns {
-        scoping: semantic.scoping(),
-        out: Vec::new(),
-    };
-    v.visit_program(&parsed.program);
-    v.out
+    analyze(src, |program, semantic| {
+        let exported = export_names(program, semantic.scoping());
+        let captures = capture_keys(semantic, &exported);
+        let mut v = Fns {
+            scoping: semantic.scoping(),
+            captures: &captures,
+            out: Vec::new(),
+        };
+        v.visit_program(program);
+        v.out
+    })
+    .unwrap_or_default()
 }
 
 /// How much of a changed module actually changed.
@@ -380,101 +598,45 @@ pub struct Func {
 
 /// Which module-local symbols are published, and under what name.
 ///
-/// `__d("M", [...], function(a, b, …, exports) { … exports.foo = u … })`: the
-/// factory parameter resolved from exports/module writes is the exports object, so an assignment to a
-/// property of it maps a stable public name onto whatever letter the minifier
-/// happened to give the local this build.
-fn export_parameter(f: &Function<'_>, scoping: &Scoping) -> Option<SymbolId> {
-    let params: Vec<_> = f
-        .params
-        .items
-        .iter()
-        .map(|p| match &p.pattern {
-            BindingPattern::BindingIdentifier(id) => id.symbol_id.get(),
-            _ => None,
-        })
-        .collect();
-    struct Writes<'s> {
-        scoping: &'s Scoping,
-        module: Vec<SymbolId>,
-        other: Vec<SymbolId>,
-    }
-    impl<'a> Visit<'a> for Writes<'_> {
-        fn visit_assignment_expression(&mut self, e: &AssignmentExpression<'a>) {
-            if let Some(m) = e.left.as_member_expression()
-                && let Expression::Identifier(r) = m.object()
-                && let Some(id) = r
-                    .reference_id
-                    .get()
-                    .and_then(|id| self.scoping.get_reference(id).symbol_id())
-            {
-                if m.static_property_name() == Some("exports") {
-                    self.module.push(id)
-                } else {
-                    self.other.push(id)
-                }
-            }
-            oxc_ast_visit::walk::walk_assignment_expression(self, e);
-        }
-    }
-    let mut w = Writes {
-        scoping,
-        module: vec![],
-        other: vec![],
-    };
-    if let Some(body) = &f.body {
-        w.visit_function_body(body);
-    }
-    f.params
-        .items
-        .iter()
-        .find_map(|p| match &p.pattern {
-            BindingPattern::BindingIdentifier(id) if id.name == "exports" => id.symbol_id.get(),
-            _ => None,
-        })
-        .or_else(|| {
-            params
-                .iter()
-                .position(|id| id.is_some_and(|id| w.module.contains(&id)))
-                .and_then(|i| params.get(i + 1).copied().flatten())
-        })
-        .or_else(|| {
-            params
-                .iter()
-                .rev()
-                .flatten()
-                .find(|id| w.other.contains(id))
-                .copied()
-        })
-        .or_else(|| {
-            params
-                .get(if params.len() == 6 { 5 } else { 6 })
-                .copied()
-                .flatten()
-        })
-}
-
+/// `__d("M", [...], function(a, b, …, module, exports) { … exports.foo = u … })`:
+/// the factory's `module` and `exports` parameters are resolved by the same
+/// rules the indexer uses ([`factory::module_and_exports`]), so an assignment
+/// onto `exports` or `module.exports` maps a stable public name onto whatever
+/// letter the minifier happened to give the local this build.
 fn export_names(program: &Program<'_>, scoping: &Scoping) -> HashMap<SymbolId, String> {
     struct Exports<'s> {
         scoping: &'s Scoping,
-        /// The exports object, once the module factory has been recognised.
-        obj: Option<SymbolId>,
+        /// The factory's bindings, once the module factory has been recognised.
+        bindings: factory::FactoryBindings,
         out: HashMap<SymbolId, String>,
         depth: u32,
     }
 
     impl<'s> Exports<'s> {
         fn symbol_of(&self, r: &IdentifierReference) -> Option<SymbolId> {
-            r.reference_id
-                .get()
-                .and_then(|id| self.scoping.get_reference(id).symbol_id())
+            reference_symbol(self.scoping, r)
+        }
+
+        /// `exports` itself, or `module.exports`.
+        fn is_export_object(&self, obj: &Expression<'_>) -> bool {
+            match obj {
+                Expression::Identifier(o) => {
+                    let s = self.symbol_of(o);
+                    s.is_some() && s == self.bindings.exports
+                }
+                Expression::StaticMemberExpression(inner) if inner.property.name == "exports" => {
+                    matches!(&inner.object, Expression::Identifier(o)
+                        if self.symbol_of(o).is_some() && self.symbol_of(o) == self.bindings.module)
+                }
+                _ => false,
+            }
         }
     }
 
     impl<'a, 's> Visit<'a> for Exports<'s> {
         fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
             if self.depth == 0 {
-                self.obj = export_parameter(f, self.scoping);
+                self.bindings = factory::module_and_exports(f, self.scoping);
             }
             self.depth += 1;
             oxc_ast_visit::walk::walk_function(self, f, flags);
@@ -483,9 +645,7 @@ fn export_names(program: &Program<'_>, scoping: &Scoping) -> HashMap<SymbolId, S
 
         fn visit_assignment_expression(&mut self, e: &AssignmentExpression<'a>) {
             if let AssignmentTarget::StaticMemberExpression(m) = &e.left
-                && let Expression::Identifier(obj) = &m.object
-                && self.symbol_of(obj).is_some()
-                && self.symbol_of(obj) == self.obj
+                && self.is_export_object(&m.object)
                 && let Expression::Identifier(local) = &e.right
                 && let Some(sym) = self.symbol_of(local)
             {
@@ -502,7 +662,7 @@ fn export_names(program: &Program<'_>, scoping: &Scoping) -> HashMap<SymbolId, S
 
     let mut v = Exports {
         scoping,
-        obj: None,
+        bindings: factory::FactoryBindings::default(),
         out: HashMap::new(),
         depth: 0,
     };
@@ -512,21 +672,11 @@ fn export_names(program: &Program<'_>, scoping: &Scoping) -> HashMap<SymbolId, S
 
 /// Every function in a module, shaped and labelled.
 pub fn functions(src: &str) -> Vec<Func> {
-    let alloc = Allocator::default();
-    let parsed = Parser::new(&alloc, src, SourceType::cjs()).parse();
-    if parsed.panicked || !parsed.diagnostics.is_empty() {
-        return vec![];
-    }
-    let semantic = SemanticBuilder::new()
-        .with_build_nodes(true)
-        .build(&parsed.program)
-        .semantic;
-    let exported = export_names(&parsed.program, semantic.scoping());
-
     struct Funcs<'s> {
         scoping: &'s Scoping,
+        captures: &'s HashMap<SymbolId, String>,
         /// Local symbol -> the name it is published under.
-        exported: HashMap<SymbolId, String>,
+        exported: &'s HashMap<SymbolId, String>,
         out: Vec<Func>,
         /// Labels of the functions we are currently inside.
         path: Vec<String>,
@@ -540,7 +690,7 @@ pub fn functions(src: &str) -> Vec<Func> {
     impl<'s> Funcs<'s> {
         fn record(
             &mut self,
-            span: oxc_span::Span,
+            span: Span,
             params: usize,
             named: Option<String>,
             canon: &Canon<'s>,
@@ -590,7 +740,7 @@ pub fn functions(src: &str) -> Vec<Func> {
 
     impl<'a, 's> Visit<'a> for Funcs<'s> {
         fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
-            let mut c = Canon::for_function(self.scoping, f.span);
+            let mut c = Canon::for_function(self.scoping, f.span, self.captures);
             c.visit_function(f, flags);
             // `function u(t)` says nothing; `exports.encodeServerErrorReceipt =
             // u` says everything, and it is the same `u`.
@@ -605,7 +755,7 @@ pub fn functions(src: &str) -> Vec<Func> {
         }
 
         fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
-            let mut c = Canon::for_function(self.scoping, f.span);
+            let mut c = Canon::for_function(self.scoping, f.span, self.captures);
             c.visit_arrow_function_expression(f);
             let label = self.record(f.span, f.params.items.len(), None, &c);
             self.path.push(label);
@@ -669,16 +819,22 @@ pub fn functions(src: &str) -> Vec<Func> {
         }
     }
 
-    let mut v = Funcs {
-        scoping: semantic.scoping(),
-        exported,
-        out: Vec::new(),
-        path: Vec::new(),
-        hint: None,
-        anon: 0,
-    };
-    v.visit_program(&parsed.program);
-    v.out
+    analyze(src, |program, semantic| {
+        let exported = export_names(program, semantic.scoping());
+        let captures = capture_keys(semantic, &exported);
+        let mut v = Funcs {
+            scoping: semantic.scoping(),
+            captures: &captures,
+            exported: &exported,
+            out: Vec::new(),
+            path: Vec::new(),
+            hint: None,
+            anon: 0,
+        };
+        v.visit_program(program);
+        v.out
+    })
+    .unwrap_or_default()
 }
 
 /// A function that exists in both revisions under one name, and differs.
@@ -817,7 +973,7 @@ pub fn diff_functions(before: &str, after: &str) -> FnDiff {
         }
     }
 
-    narrow(&mut d);
+    narrow(&mut d, before, after);
     d.total = d.kept + d.changed.len() + d.added.len();
 
     // Biggest first: a 400-token function that changed is the release, a
@@ -836,36 +992,79 @@ pub fn diff_functions(before: &str, after: &str) -> FnDiff {
 /// really happened. Reading a chain of ancestors tells you nothing the innermost
 /// entry did not already say.
 ///
+/// Containment alone is not proof that an ancestor merely inherited its change,
+/// though: the enclosing function can have an edit of its own beside the
+/// nested one. So an ancestor is collapsed only when its *skeleton* — its
+/// canonical stream with every changed descendant replaced by one placeholder,
+/// and every added or removed descendant left out — is the same in both
+/// revisions. An ancestor that changed independently stays in the report.
+///
 /// Containment comes from spans rather than labels, because an unnamed ancestor
 /// is deliberately stripped out of its descendants' labels and cannot be
 /// recovered from them. The two directions are resolved separately: `changed`
 /// and `added` carry offsets into the new revision, `removed` into the old, and
 /// comparing across the two would be comparing coordinates from different files.
-fn narrow(d: &mut FnDiff) {
-    let new_spans: Vec<_> = d
+fn narrow(d: &mut FnDiff, before: &str, after: &str) {
+    let new_excise: Vec<Excised> = d
         .changed
         .iter()
-        .map(|c| (c.after.start, c.after.end))
-        .chain(d.added.iter().map(|f| (f.start, f.end)))
+        .map(|c| (c.after.start, c.after.end, true))
+        .chain(d.added.iter().map(|f| (f.start, f.end, false)))
+        .map(|(start, end, placeholder)| Excised {
+            start,
+            end,
+            placeholder,
+        })
         .collect();
-    let old_spans: Vec<_> = d
+    let old_excise: Vec<Excised> = d
         .changed
         .iter()
-        .map(|c| (c.before.start, c.before.end))
-        .chain(d.removed.iter().map(|f| (f.start, f.end)))
+        .map(|c| (c.before.start, c.before.end, true))
+        .chain(d.removed.iter().map(|f| (f.start, f.end, false)))
+        .map(|(start, end, placeholder)| Excised {
+            start,
+            end,
+            placeholder,
+        })
         .collect();
-    let contains = |s, e, spans: &[(u32, u32)]| {
+    let contains = |s: u32, e: u32, spans: &[Excised]| {
         spans
             .iter()
-            .any(|&(a, b)| (a, b) != (s, e) && s <= a && b <= e)
+            .any(|x| (x.start, x.end) != (s, e) && s <= x.start && x.end <= e)
     };
-    let previous = d.changed.len();
-    d.changed.retain(|c| {
-        !contains(c.after.start, c.after.end, &new_spans)
-            && !contains(c.before.start, c.before.end, &old_spans)
-    });
-    // Ancestors narrowed out of the report are structural overlap, not extra edits.
-    d.kept += previous - d.changed.len();
+    let ancestors: Vec<usize> = (0..d.changed.len())
+        .filter(|&i| {
+            let c = &d.changed[i];
+            contains(c.after.start, c.after.end, &new_excise)
+                || contains(c.before.start, c.before.end, &old_excise)
+        })
+        .collect();
+    if !ancestors.is_empty() {
+        let old_roots: Vec<_> = ancestors
+            .iter()
+            .map(|&i| (d.changed[i].before.start, d.changed[i].before.end))
+            .collect();
+        let new_roots: Vec<_> = ancestors
+            .iter()
+            .map(|&i| (d.changed[i].after.start, d.changed[i].after.end))
+            .collect();
+        let old_skeletons = skeletons(before, &old_roots, &old_excise);
+        let new_skeletons = skeletons(after, &new_roots, &new_excise);
+        let explained: Vec<usize> = ancestors
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| old_skeletons[k].is_some() && old_skeletons[k] == new_skeletons[k])
+            .map(|(_, &i)| i)
+            .collect();
+        let previous = d.changed.len();
+        let mut i = 0;
+        d.changed.retain(|_| {
+            i += 1;
+            !explained.contains(&(i - 1))
+        });
+        // Ancestors narrowed out of the report are structural overlap, not extra edits.
+        d.kept += previous - d.changed.len();
+    }
     // Whole additions/removals retain their outer API, not only its callbacks.
     let added: Vec<_> = d.added.iter().map(|f| (f.start, f.end)).collect();
     d.added.retain(|f| {
@@ -879,6 +1078,62 @@ fn narrow(d: &mut FnDiff) {
             .iter()
             .any(|&(a, b)| (a, b) != (f.start, f.end) && a <= f.start && f.end <= b)
     });
+}
+
+/// The canonical stream of each function rooted at `roots`, with the nested
+/// functions in `excise` left out or replaced by a placeholder. `None` for a
+/// root that is not found or a module that does not parse.
+fn skeletons(src: &str, roots: &[(u32, u32)], excise: &[Excised]) -> Vec<Option<String>> {
+    struct Find<'s> {
+        scoping: &'s Scoping,
+        captures: &'s HashMap<SymbolId, String>,
+        roots: &'s [(u32, u32)],
+        excise: &'s [Excised],
+        out: Vec<Option<String>>,
+    }
+    impl<'s> Find<'s> {
+        fn slot(&self, span: Span) -> Option<usize> {
+            self.roots.iter().position(|&r| r == (span.start, span.end))
+        }
+        fn canon(&self, span: Span) -> Canon<'s> {
+            Canon {
+                excise: self.excise,
+                ..Canon::for_function(self.scoping, span, self.captures)
+            }
+        }
+    }
+    impl<'a, 's> Visit<'a> for Find<'s> {
+        fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+            if let Some(k) = self.slot(f.span) {
+                let mut c = self.canon(f.span);
+                c.visit_function(f, flags);
+                self.out[k] = Some(c.out);
+            }
+            oxc_ast_visit::walk::walk_function(self, f, flags);
+        }
+        fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
+            if let Some(k) = self.slot(f.span) {
+                let mut c = self.canon(f.span);
+                c.visit_arrow_function_expression(f);
+                self.out[k] = Some(c.out);
+            }
+            oxc_ast_visit::walk::walk_arrow_function_expression(self, f);
+        }
+    }
+    analyze(src, |program, semantic| {
+        let exported = export_names(program, semantic.scoping());
+        let captures = capture_keys(semantic, &exported);
+        let mut v = Find {
+            scoping: semantic.scoping(),
+            captures: &captures,
+            roots,
+            excise,
+            out: vec![None; roots.len()],
+        };
+        v.visit_program(program);
+        v.out
+    })
+    .unwrap_or_else(|| vec![None; roots.len()])
 }
 
 #[cfg(test)]
@@ -1268,6 +1523,10 @@ mod regression_tests {
             ("var a=`old`", "var a=`new`"),
             ("a.b()", "a?.b()"),
             ("var a={get x(){return 1}}", "var a={x(){return 1}}"),
+            ("var [,a]=x", "var [a]=x"),
+            ("var a;[,a]=x", "var a;[a]=x"),
+            ("for(a;;);", "for(;a;);"),
+            ("for(;a;);", "for(;;a);"),
         ] {
             assert_eq!(compare(a, b), Verdict::Changed, "{a} -> {b}");
         }
@@ -1281,6 +1540,58 @@ mod regression_tests {
         assert_eq!(d.changed[0].label, "B");
         assert!(d.added.is_empty() && d.removed.is_empty());
         assert_eq!(d.total - d.kept, 1);
+    }
+    /// Inserting a binding earlier in the module shifts every later symbol
+    /// index. A function capturing a later binding is still the same program.
+    #[test]
+    fn inserting_a_binding_before_a_capture_does_not_change_its_consumers() {
+        for (a, b) in [
+            (
+                "__d('M',[],function(g,r,d,l,m,e){var a=1;e.foo=function(){return a}})",
+                "__d('M',[],function(g,r,d,l,m,e){var z=2;var a=1;e.foo=function(){return a}})",
+            ),
+            (
+                "__d('M',[],function(g,r,d,l,m,e){var a=r('A'),b=r('B');function x(){return b()}e.X=x})",
+                "__d('M',[],function(g,r,d,l,m,e){var z=1;var a=r('A'),b=r('B');function x(){return b()}e.X=x})",
+            ),
+        ] {
+            let d = diff_functions(a, b);
+            let labels: Vec<_> = d.changed.iter().map(|c| c.label.as_str()).collect();
+            // The factory itself gained a statement; nothing inside it changed.
+            assert_eq!(labels.len(), 1, "{labels:?}");
+            assert!(labels[0].starts_with('#'), "{labels:?}");
+            assert!(d.added.is_empty() && d.removed.is_empty(), "{d:?}");
+        }
+    }
+    /// Captured bindings with the same description are still told apart.
+    #[test]
+    fn captures_of_distinct_local_functions_are_distinct() {
+        let a = "__d('M',[],function(g,r,d,l,m,e){function p(){}function q(){}e.A=function(){return p()}})";
+        let d = diff_functions(a, &a.replace("return p()", "return q()"));
+        let labels: Vec<_> = d.changed.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["A"]);
+    }
+    /// An enclosing function with an edit of its own stays in the report; one
+    /// whose only change is the nested edit collapses into it.
+    #[test]
+    fn ancestors_with_independent_edits_are_kept() {
+        let a = "var e={};e.outer=function(){let f=()=>1;return 2}";
+        let both = diff_functions(a, "var e={};e.outer=function(){let f=()=>3;return 4}");
+        let mut labels: Vec<_> = both.changed.iter().map(|c| c.label.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["outer", "outer/#1"]);
+        assert_eq!(both.total - both.kept, 2);
+        let inner = diff_functions(a, "var e={};e.outer=function(){let f=()=>3;return 2}");
+        let labels: Vec<_> = inner.changed.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["outer/#1"]);
+        assert_eq!(inner.total - inner.kept, 1);
+    }
+    #[test]
+    fn module_exports_members_name_functions() {
+        let a = "__d('M',[],function(g,r,i,a,m,e){function f(){return 1}m.exports.foo=f})";
+        let d = diff_functions(a, &a.replace("return 1", "return 2"));
+        let labels: Vec<_> = d.changed.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["foo"]);
     }
     #[test]
     fn injected_parameter_is_not_exports() {
