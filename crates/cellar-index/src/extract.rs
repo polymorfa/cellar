@@ -13,7 +13,7 @@ use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, Function, Program, Statement,
 };
 use oxc_ast_visit::{Visit, walk};
-use oxc_semantic::{Scoping, SymbolId, SemanticBuilder};
+use oxc_semantic::{Scoping, SemanticBuilder, SymbolId};
 
 /// The Metro module-definition function.
 pub const DEFINE_FN: &str = "__d";
@@ -128,7 +128,9 @@ fn factory_function<'b, 'a>(arg: &'b Argument<'a>) -> Option<&'b Function<'a>> {
 }
 
 fn symbol(scoping: &Scoping, id: &oxc_ast::ast::IdentifierReference<'_>) -> Option<SymbolId> {
-    id.reference_id.get().and_then(|id| scoping.get_reference(id).symbol_id())
+    id.reference_id
+        .get()
+        .and_then(|id| scoping.get_reference(id).symbol_id())
 }
 
 /// Which identifiers have properties assigned onto them, split by whether the
@@ -148,9 +150,15 @@ impl<'a> Visit<'a> for Assigned<'_> {
         {
             match member.object() {
                 Expression::Identifier(obj) if prop == "exports" => {
-                    if let Some(id) = symbol(self.scoping,obj) { self.dot_exports.push(id) }
+                    if let Some(id) = symbol(self.scoping, obj) {
+                        self.dot_exports.push(id)
+                    }
                 }
-                Expression::Identifier(obj) => if let Some(id) = symbol(self.scoping,obj) { self.other.push(id) },
+                Expression::Identifier(obj) => {
+                    if let Some(id) = symbol(self.scoping, obj) {
+                        self.other.push(id)
+                    }
+                }
                 // `X.exports.prop = …`. The object is itself a member
                 // expression, so the plain identifier case never sees it, and
                 // without this the one form that most clearly identifies the
@@ -160,7 +168,9 @@ impl<'a> Visit<'a> for Assigned<'_> {
                         && inner.static_property_name() == Some("exports")
                         && let Expression::Identifier(obj) = inner.object()
                     {
-                        if let Some(id) = symbol(self.scoping,obj) { self.dot_exports.push(id) };
+                        if let Some(id) = symbol(self.scoping, obj) {
+                            self.dot_exports.push(id)
+                        };
                     }
                 }
             }
@@ -207,7 +217,11 @@ impl<'s> FactoryScan<'s> {
             })
             .collect();
 
-        let mut assigned = Assigned { scoping, dot_exports: vec![], other: vec![] };
+        let mut assigned = Assigned {
+            scoping,
+            dot_exports: vec![],
+            other: vec![],
+        };
         if let Some(body) = &factory.body {
             assigned.visit_function_body(body);
         }
@@ -290,7 +304,8 @@ impl<'s> FactoryScan<'s> {
 
         // `<exports>.prop = …`
         if let Expression::Identifier(obj) = member.object()
-            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.exports_binding
+            && symbol(self.scoping, obj).is_some()
+            && symbol(self.scoping, obj) == self.exports_binding
         {
             self.exports.push(prop.to_string());
             return;
@@ -298,7 +313,8 @@ impl<'s> FactoryScan<'s> {
 
         // `<module>.exports = …`
         if let Expression::Identifier(obj) = member.object()
-            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.module_binding
+            && symbol(self.scoping, obj).is_some()
+            && symbol(self.scoping, obj) == self.module_binding
             && prop == "exports"
         {
             self.exports.push("default".to_string());
@@ -309,7 +325,8 @@ impl<'s> FactoryScan<'s> {
         if let Some(inner) = member.object().as_member_expression()
             && inner.static_property_name() == Some("exports")
             && let Expression::Identifier(obj) = inner.object()
-            && symbol(self.scoping,obj).is_some() && symbol(self.scoping,obj) == self.module_binding
+            && symbol(self.scoping, obj).is_some()
+            && symbol(self.scoping, obj) == self.module_binding
         {
             self.exports.push(prop.to_string());
         }
@@ -338,13 +355,15 @@ mod tests {
 
     #[test]
     fn block_shadow_and_captured_exports_are_distinct() {
-        let f=facts("__d('M',[],function(g,r,i,n,l,m,e){ {let e={};e.tmp=1} function f(){e.real=1} })");
-        assert_eq!(f.exports,vec!["real"]);
+        let f = facts(
+            "__d('M',[],function(g,r,i,n,l,m,e){ {let e={};e.tmp=1} function f(){e.real=1} })",
+        );
+        assert_eq!(f.exports, vec!["real"]);
     }
     #[test]
     fn nested_parameter_shadow_does_not_select_exports() {
-        let f=facts("__d('M',[],function(g,r,i,n,l,m,e){function f(e){e.tmp=1}m.real=1})");
-        assert_eq!(f.exports,vec!["real"]);
+        let f = facts("__d('M',[],function(g,r,i,n,l,m,e){function f(e){e.tmp=1}m.real=1})");
+        assert_eq!(f.exports, vec!["real"]);
     }
     #[test]
     fn reads_name_and_positional_deps() {
