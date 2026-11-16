@@ -20,11 +20,13 @@
 
 pub mod builtin;
 pub mod diff;
+pub mod factory;
 pub mod filter;
 pub mod graph;
 pub mod model;
 pub mod naming;
 pub mod search;
+pub mod shape;
 pub mod store;
 
 pub use diff::{BundleDiff, ChangeKind, DiffOptions, ModuleChange, SourceLoader, diff_bundles};

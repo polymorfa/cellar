@@ -401,7 +401,13 @@ fn tools() -> Vec<Value> {
              modified, with dependency and export deltas and unified diffs. Changes whose \
              every altered line is transpiler churn are counted as `noiseOnly` in the summary \
              and withheld unless `includeNoise` is set. Start with `includeHunks: false` for \
-             an overview, then re-run for the modules you care about.",
+             an overview, then re-run for the modules you care about. Set `semantic: true` \
+             to tell a rename from a real change: each changed module is compared with its \
+             local names erased, giving a `verdict` of `renamedOnly` or `changed` and, for \
+             the latter, the names of the functions that actually changed. In a minified \
+             bundle most byte-level diffs are rename cascades, which no line-level rule can \
+             recognise, so this is usually the difference between thousands of changed \
+             modules and a list worth reading.",
             json!({
                 "type": "object",
                 "properties": {
@@ -411,6 +417,7 @@ fn tools() -> Vec<Value> {
                     "includeHunks": { "type": "boolean", "default": true },
                     "contextLines": { "type": "integer", "default": 3 },
                     "includeNoise": { "type": "boolean", "default": false },
+                    "semantic": { "type": "boolean", "default": false, "description": "Classify each change as renamedOnly or changed by comparing programs with local names erased, and name the changed functions. Parses both sides of every changed module." },
                     "limit": { "type": "integer", "description": "Cap the change list; the summary still reports true totals." }
                 },
                 "required": ["old", "new"],
@@ -639,6 +646,7 @@ fn call_tool(ctx: &Ctx, name: &str, args: &Value) -> Result<Value> {
                 include_hunks: arg_bool(args, "includeHunks", true),
                 context_lines: arg_usize(args, "contextLines", 3),
                 include_noise_only: arg_bool(args, "includeNoise", false),
+                semantic: arg_bool(args, "semantic", false),
                 ..DiffOptions::default()
             };
             ctx.diff(

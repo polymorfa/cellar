@@ -24,5 +24,6 @@ oxc_ast_visit = { workspace = true }
 oxc_codegen = { workspace = true }
 oxc_parser = { workspace = true }
 oxc_span = { workspace = true }
+oxc_semantic = { workspace = true }
 rayon = "1.12"
 sha2 = { version = "0.11", default-features = false }
